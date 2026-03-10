@@ -40,7 +40,7 @@ frontend/src/components/providers/AuthProvider.tsx
 AuthProvider đọc biến môi trường `NEXT_PUBLIC_AUTH_MODE` để quyết định kiểu bảo vệ nào:
 
 ```
-Nếu AUTH_MODE = "clerk" VÀ có CLERK_KEY hợp lệ (bắt đầu bằng "pk_")
+Nếu AUTH_MODE = "clerk" VÀ có CLERK_KEY hợp lệ (pk_test_... hoặc pk_live_..., body >= 16 ký tự)
   → Bọc app trong ClerkProvider (hệ thống thẻ nhân viên)
   → Xoá token local cũ nếu có (tránh xung đột)
 
@@ -55,28 +55,31 @@ Nếu AUTH_MODE = "local" HOẶC không set gì
 **Bên trong xảy ra gì:**
 
 ```
-1. LocalAuthGate mount → check sessionStorage có key "oc_local_token" không
+1. LocalAuthGate mount → check sessionStorage có key "mc_local_auth_token" không
    ├── Có token → render app ngay (bạn đã vào rồi)
    └── Không có → hiện form LocalAuthLogin
 
-2. User nhập token, bấm "Sign In"
-   → POST /api/v1/auth/verify (kèm header Authorization: Bearer <token>)
+2. User nhập token (tối thiểu 50 ký tự), bấm "Sign In"
+   → GET /api/v1/users/me (kèm header Authorization: Bearer <token>)
 
 3. Backend nhận request:
    → Tách bearer token từ header
-   → So sánh với LOCAL_AUTH_TOKEN trong env (dùng compare_digest — chống timing attack)
-   ├── Khớp → tạo/lấy user "local-auth-user", trả {"ok": true}
+   → So sánh với LOCAL_AUTH_TOKEN trong env (dùng hmac.compare_digest — chống timing attack)
+   → LOCAL_AUTH_TOKEN phải >= 50 ký tự, không được là placeholder ("change-me", "changeme"...)
+   ├── Khớp → tạo/lấy user "local-auth-user", trả user profile
    └── Không khớp → trả 401 "Invalid token"
 
 4. Frontend nhận 200:
-   → Lưu token vào sessionStorage (mất khi đóng tab)
-   → Re-render → app hiện ra
+   → Lưu token vào sessionStorage key "mc_local_auth_token" (mất khi đóng tab)
+   → window.location.reload() → app hiện ra
 ```
 
 **Điểm thú vị:**
 - `sessionStorage` (không phải localStorage): đóng tab = logout tự động
-- `compare_digest`: so sánh từng byte cùng tốc độ, hacker không thể đoán từng ký tự
+- Storage key: `mc_local_auth_token`
+- `hmac.compare_digest`: so sánh từng byte cùng tốc độ, hacker không thể đoán từng ký tự
 - Chỉ có 1 user duy nhất cho local mode: ID cố định `"local-auth-user"`
+- Token tối thiểu 50 ký tự, không chấp nhận placeholder values
 
 ```
                                               ┌─────────────────┐
@@ -101,13 +104,20 @@ Nếu AUTH_MODE = "local" HOẶC không set gì
 1. ClerkProvider bọc toàn bộ app
 2. Chưa login → redirect tới /sign-in
 3. /sign-in render <SignIn /> component của Clerk
-4. User đăng nhập qua Clerk → nhận JWT cookie
+4. User đăng nhập qua Clerk (email, Google, GitHub...) → nhận JWT cookie
 5. Mỗi API call:
    → mutator.ts gọi Clerk.session.getToken() → lấy JWT mới
    → Gửi kèm header Authorization: Bearer <jwt>
-6. Backend verify JWT bằng Clerk SDK
+6. Backend verify JWT bằng Clerk SDK:
+   → authenticate_request() verify signature + clock skew (±10s)
+   → Extract user profile từ JWT claims
    → Sync user vào DB local (email, tên, ảnh)
+   → Nếu thiếu info → gọi Clerk API lấy full profile (timeout 5s, fail = log only)
+   → Đảm bảo user có organization membership
    → Trả AuthContext cho route handler
+7. Bootstrap endpoint: POST /api/v1/auth/bootstrap
+   → Frontend gọi sau khi có token để lấy user profile đầy đủ
+   → Trả về UserRead (id, email, name, preferences, admin status)
 ```
 
 ### Bước 3: Token đi theo mọi request — "Thẻ ra vào luôn trên cổ"
@@ -127,32 +137,35 @@ Thứ tự ưu tiên:
 
 ### Bước 4: Agent Auth — "Cửa dành cho robot"
 
-Agent không login qua giao diện. Chúng dùng **X-Agent-Token** header:
+Agent không login qua giao diện. Chúng dùng **X-Agent-Token** header (hoặc fallback Bearer token):
 
 ```
 Agent gửi request:
-  Header: X-Agent-Token: <plain-token>
+  Header: X-Agent-Token: <plain-token>  (ưu tiên)
+  HOẶC:  Authorization: Bearer <plain-token>  (fallback)
 
 Backend nhận:
-  1. Kiểm tra X-Agent-Token TRƯỚC (ưu tiên hơn Bearer token)
-  2. SHA-256 hash token nhận được
-  3. Tìm Agent có agent_token_hash khớp trong DB
+  1. Kiểm tra X-Agent-Token TRƯỚC (ưu tiên hơn user auth)
+  2. Duyệt tất cả agent có agent_token_hash trong DB
+  3. Verify token bằng PBKDF2-HMAC-SHA256 (200,000 iterations, constant-time comparison)
   4. Agent.is_active == true? → OK
-  5. Trả AuthContext(actor_type="agent", agent=agent)
+  5. Cập nhật last_seen_at (throttle 30s), status = "online"
+  6. Trả AuthContext(actor_type="agent", agent=agent)
 ```
 
 **Bảo mật token:**
 - Token gốc chỉ hiện **1 lần duy nhất** khi tạo agent
-- DB chỉ lưu SHA-256 hash (không thể đảo ngược)
+- DB lưu PBKDF2 hash: `pbkdf2_sha256$200000${salt}${digest}` (không thể đảo ngược)
+- Constant-time comparison chống timing attack
 - Giống cách GitHub Personal Access Token hoạt động
 
 ### Tóm tắt Authentication
 
 | Ai? | Dùng gì? | Gửi qua? | Backend check? |
 |-----|----------|-----------|----------------|
-| User (local) | Bearer token | Authorization header | compare_digest vs ENV |
-| User (clerk) | JWT | Authorization header | Clerk SDK verify |
-| Agent | API token | X-Agent-Token header | SHA-256 hash lookup |
+| User (local) | Bearer token (>=50 chars) | Authorization header | hmac.compare_digest vs ENV |
+| User (clerk) | JWT | Authorization header | Clerk SDK verify + user sync |
+| Agent | API token | X-Agent-Token (hoặc Bearer) | PBKDF2 hash verify (200K iter) |
 
 ---
 
@@ -371,8 +384,8 @@ POST /api/v1/agents
 Body: { name: "CodeBot", agent_type: "worker", capabilities: ["code_review", "testing"] }
 
 Backend:
-  1. Tạo token ngẫu nhiên: secrets.token_urlsafe(48) → 64 ký tự
-  2. Hash token: SHA-256(raw_token) → lưu hash vào DB
+  1. Tạo token ngẫu nhiên: 32-byte URL-safe random token
+  2. Hash token: PBKDF2-HMAC-SHA256 (200K iterations, random salt) → lưu hash vào DB
   3. Tạo Agent record (status: "idle")
   4. Trả về: { ...agent_data, agent_token: "<plain-token>" }
                                           ⬆ CHỈ HIỆN 1 LẦN DUY NHẤT!
@@ -385,15 +398,16 @@ Frontend:
 ```
 
 ```
-  ┌──── Lần đầu tạo ────────────────────────┐
-  │                                          │
-  │  Raw Token: "sk_agent_a8f3k2..."         │
-  │       │                                  │
-  │       ├──► SHA-256 ──► DB (hash only)    │
-  │       │                                  │
-  │       └──► Hiện cho admin (1 lần duy nhất)│
-  │                                          │
-  └──────────────────────────────────────────┘
+  ┌──── Lần đầu tạo ──────────────────────────────────────┐
+  │                                                       │
+  │  Raw Token: "sk_agent_a8f3k2..."                      │
+  │       │                                               │
+  │       ├──► PBKDF2(200K iter, random salt) ──► DB hash │
+  │       │    Format: pbkdf2_sha256$200000$salt$digest    │
+  │       │                                               │
+  │       └──► Hiện cho admin (1 lần duy nhất)            │
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
 
   Sau đó: Token gốc KHÔNG CÒN ở đâu trong hệ thống.
           Mất = phải regenerate token mới.

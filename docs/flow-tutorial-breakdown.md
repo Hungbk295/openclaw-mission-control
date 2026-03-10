@@ -174,191 +174,281 @@ Backend nhận:
 ### Liên tưởng
 
 Board giống như một **bảng Kanban treo tường** trong phòng họp:
-- **Board** = tấm bảng (có nhiều cột)
-- **Columns** = các cột trên bảng ("To Do", "Doing", "Done")
+- **Board** = tấm bảng (4 cột cố định)
+- **4 Columns** = Inbox, In Progress, Review, Done
 - **Task** = tờ sticky note dán trên bảng
-- **Position** = vị trí sticky note trong cột (trên/dưới)
+- **Board Rules** = bộ luật chi phối ai được làm gì với task
+
+Board KHÔNG chỉ là nơi chứa task — nó có **hệ thống rules phức tạp** quyết định
+ai được di chuyển task, khi nào cần approval, khi nào cần review.
 
 ### Bước 1: Tạo Board — "Treo bảng mới lên tường"
 
-**User thấy gì:** Bấm "New Board" → form hiện ra (tên, mô tả, loại).
-
-**Bên trong:**
+**User thấy gì:** Bấm "New Board" → form (tên, mô tả, gateway).
 
 ```
 POST /api/v1/boards
-Body: { name: "Sprint 42", description: "...", board_type: "kanban" }
+Body: { name: "Sprint 42", description: "...", gateway_id: "..." }
 
 Backend:
-1. Verify user là org member
-2. Tạo Board:
+1. Validate gateway tồn tại VÀ có main agent
+2. Validate board group (nếu có)
+3. Tạo Board:
    - slug = slugify("Sprint 42") → "sprint-42"
-   - column_config = DEFAULT_COLUMNS (5 cột mặc định)
-   - lead_user_id = user hiện tại
-3. Tự động thêm creator làm BoardMember với role "lead"
-4. Ghi activity: "board.created"
-5. Trả về BoardRead
+   - organization_id = user's org
+4. Trả về BoardRead
+
+Board Rules (mặc định, có thể thay đổi sau):
+  require_approval_for_done = true    ← Agent cần approval trước khi done
+  require_review_before_done = false  ← Phải qua review trước done?
+  comment_required_for_review = false ← Phải có comment khi vào review?
+  block_status_changes_with_pending_approval = false
+  only_lead_can_change_status = false ← Chỉ lead mới được chuyển status?
+  max_agents = null                   ← Giới hạn số agent
 ```
 
-**5 cột mặc định:**
+**4 cột cố định:**
 ```
-┌──────────┬──────────┬────────────┬──────────┬──────────┐
-│ Backlog  │  To Do   │In Progress │  Review  │   Done   │
-│  (xám)   │  (xanh)  │  (vàng)    │  (tím)   │ (xanh lá)│
-│          │          │            │          │ is_done  │
-└──────────┴──────────┴────────────┴──────────┴──────────┘
+┌──────────┬────────────┬──────────┬──────────┐
+│  Inbox   │In Progress │  Review  │   Done   │
+│  (slate) │  (purple)  │ (indigo) │  (green) │
+└──────────┴────────────┴──────────┴──────────┘
 ```
 
-Mỗi cột có: `name` (key), `label` (hiển thị), `color`, `wip_limit` (giới hạn), `is_done` (đánh dấu cột hoàn thành).
-
-### Bước 2: Xem Board — "Nhìn vào bảng"
+### Bước 2: Xem Board — "Nhìn vào bảng" (Real-time via SSE)
 
 ```
 User vào /boards/{board_id}
 
-Frontend gửi 2 request song song:
-  1. GET /api/v1/boards/{board_id} → Thông tin board + column_config
-  2. GET /api/v1/tasks?board_id={board_id} → Tất cả task
+Frontend mở 3 SSE streams song song (Server-Sent Events):
+  1. /boards/{board_id}/tasks/stream      ← Task updates real-time
+  2. /boards/{board_id}/approvals/stream  ← Approval updates real-time
+  3. /boards/{board_id}/memory/stream     ← Chat/memory updates real-time
 
-Render:
-  Với mỗi column trong column_config:
-    → Lọc tasks có status === column.name
-    → Render KanbanColumn chứa các TaskCard
+VÀ fetch Board Snapshot (tất cả data 1 lần):
+  GET /api/v1/boards/{board_id}/snapshot
 
-Cấu trúc component:
+BoardSnapshot chứa:
+  {
+    board: BoardRead,
+    tasks: [TaskCardRead],          ← Tasks kèm blocking info
+    agents: [AgentRead],            ← Agents trên board
+    approvals: [ApprovalRead],      ← 200 approvals gần nhất
+    chat_messages: [BoardMemoryRead],← 200 chat messages gần nhất
+    pending_approvals_count: int
+  }
+
+TaskCardRead = TaskRead + enriched data:
+  {
+    ...task fields,
+    assignee: "CodeBot",            ← Tên agent được gán
+    approvals_count: 2,
+    approvals_pending_count: 1,
+    depends_on_task_ids: [...],     ← Danh sách dependency
+    blocked_by_task_ids: [...],     ← Dependencies chưa done
+    is_blocked: true,               ← Có bị block không?
+    tags: [{ id, name, color }]
+  }
+
+Render Kanban:
   BoardDetailPage
-  ├── BoardHeader (tên, mô tả, settings)
-  ├── BoardToolbar (filters, search)
-  └── KanbanBoard
-      ├── KanbanColumn "Backlog" → [TaskCard, TaskCard]
-      ├── KanbanColumn "To Do" → [TaskCard, TaskCard, TaskCard]
-      ├── KanbanColumn "In Progress" → [TaskCard]
-      ├── KanbanColumn "Review" → [TaskCard]
-      └── KanbanColumn "Done" → [TaskCard, TaskCard]
+  ├── BoardHeader
+  └── TaskBoard (organisms/TaskBoard.tsx)
+      ├── Column "Inbox" → [TaskCard, TaskCard]
+      ├── Column "In Progress" → [TaskCard]
+      ├── Column "Review" → [TaskCard]
+      └── Column "Done" → [TaskCard, TaskCard]
+
+TaskCard hiển thị:
+  - Title, priority badge (màu nền theo priority)
+  - Assignee name
+  - Due date (đỏ nếu overdue)
+  - Tag pills (3 đầu tiên)
+  - Approval pending count badge
+  - Viền đỏ bên trái nếu BLOCKED
+  - Drag-enabled (kéo thả)
+  - FLIP animation khi di chuyển
 ```
 
 ### Bước 3: Tạo Task — "Dán sticky note mới"
 
-**2 cách tạo:**
-
-**Cách nhanh** (inline): Bấm "+" trong cột → nhập title → Enter
 ```
-POST /api/v1/tasks { board_id, title: "Fix login bug", status: "todo" }
-```
-
-**Cách đầy đủ** (dialog): Mở form → điền title, description, priority, assignee, tags, due date
-```
-POST /api/v1/tasks { board_id, title, description, priority, assignee_id, tag_ids, due_date }
-```
-
-**Backend xử lý:**
-```
-1. Verify board write access
-2. Tính position = max_position hiện tại + 1000
-   (Tại sao +1000? Để sau này chèn giữa 2 task dễ dàng.
-    VD: task A ở 1000, task B ở 2000 → chèn C ở 1500)
-3. Tạo Task record
-4. Gắn tags qua bảng trung gian TaskTag
-5. Ghi activity: "task.created"
-6. Gửi webhook (nếu board có cấu hình)
-7. Trả về TaskRead
-```
-
-### Bước 4: Kéo thả Task — "Di chuyển sticky note"
-
-**User kéo task từ "To Do" sang "In Progress":**
-
-```
-Frontend:
-  1. Drag start → ghi nhớ vị trí cũ
-  2. Drop → tính position mới dựa trên vị trí thả
-  3. Optimistic update: card di chuyển NGAY trước khi API trả về
-  4. POST /api/v1/tasks/batch-move {
-       board_id,
-       moves: [{ task_id, status: "in_progress", position: 1500 }]
-     }
+POST /api/v1/boards/{board_id}/tasks
+Body: {
+  title: "Fix login bug",
+  description: "...",
+  status: "inbox",                    ← Mặc định vào Inbox
+  priority: "medium",                 ← low / medium / high
+  due_at: "2024-06-01T00:00:00Z",
+  assigned_agent_id: null,
+  depends_on_task_ids: [...],         ← Dependencies ngay khi tạo
+  tag_ids: [...],
+  custom_field_values: {...}
+}
 
 Backend:
-  1. Cập nhật task.status, task.position
-  2. Nếu chuyển từ "todo" → bất kỳ cột khác:
-     → Đặt task.started_at = now (lần đầu bắt đầu)
-  3. Nếu chuyển vào cột "done":
-     → Đặt task.completed_at = now
-  4. Nếu chuyển từ "done" ra:
-     → Xoá task.completed_at (task được mở lại)
-  5. KIỂM TRA DEPENDENCIES:
-     → Task có bị block bởi task khác chưa hoàn thành?
-     → Nếu có → 409 "Task blocked by N dependencies"
-  6. Ghi activity: "task.status_changed" (kèm old/new status)
-  7. Gửi webhook
-
-Nếu API lỗi:
-  → Frontend revert về vị trí cũ (undo optimistic update)
+  1. Validate dependencies:
+     → Không tự phụ thuộc chính mình
+     → Tất cả dependency tasks phải cùng board
+     → DFS kiểm tra vòng tròn
+     → Nếu có dependency chưa done → task phải ở "inbox"
+  2. Validate tag IDs thuộc org
+  3. Tạo Task record
+  4. Tạo TaskDependency edges
+  5. Lưu custom field values
+  6. Ghi activity: "task.created"
+  7. Thông báo agent (nếu assigned) và board lead
+  8. Trả về TaskRead
 ```
 
-```
-             Kéo task "Fix bug"
-                    │
-    ┌───────────────┼───────────────┐
-    │   To Do       │  In Progress  │
-    │               │               │
-    │  ┌─────────┐  │               │
-    │  │ Fix bug │──┼──►  ┌─────────┐
-    │  └─────────┘  │     │ Fix bug │
-    │               │     └─────────┘
-    │  ┌─────────┐  │               │
-    │  │ Add API │  │               │
-    │  └─────────┘  │               │
-    └───────────────┴───────────────┘
+### Bước 4: Di chuyển Task — "3 người chơi, 3 bộ luật"
 
-    Đồng thời: PATCH task.status = "in_progress"
-               task.started_at = now()
-               activity "task.status_changed" logged
+Đây là phần phức tạp nhất. Hệ thống có **3 loại actor** với **quyền khác nhau**:
+
+```
+PATCH /api/v1/boards/{board_id}/tasks/{task_id}
+Body: { status: "in_progress" }
+```
+
+**Actor 1: Worker Agent — "Công nhân"**
+```
+Quyền hạn hẹp nhất:
+  - Chỉ update: status, comment, custom fields
+  - Chỉ update task ĐANG GÁN cho mình
+  - Không được đổi status nếu only_lead_can_change_status = true
+
+Status transitions cho worker:
+  inbox → in_progress   ← Tự gán cho mình, đặt in_progress_at
+  in_progress → review  ← Gửi cho lead review, bỏ gán mình
+  in_progress → inbox   ← Trả lại, bỏ gán, xoá in_progress_at
+  review → inbox        ← Rút lại review
+
+BLOCKING: Di chuyển khỏi inbox yêu cầu TẤT CẢ dependencies phải "done"
+```
+
+**Actor 2: Board Lead Agent — "Quản đốc"**
+```
+Quyền hạn trung bình:
+  - Update tất cả fields (assign, tags, dependencies, custom fields)
+  - Chỉ đổi status khi task đang ở "review"
+
+Status transitions cho lead:
+  review → done    ← Duyệt xong, task hoàn thành
+  review → inbox   ← Trả lại worker (rework), auto-assign lại worker cũ
+
+Validation chain khi chuyển sang "done":
+  1. Check dependencies (phải hết block)
+  2. Check pending approvals (nếu block_status_changes_with_pending_approval)
+  3. Check require_review_before_done
+  4. Check require_approval_for_done
+```
+
+**Actor 3: Admin User — "Quản trị viên"**
+```
+Quyền hạn rộng nhất:
+  - Update mọi field: status, dependencies, tags, assignment, custom fields
+  - Đổi dependencies bất kỳ lúc nào (trừ task đã done)
+  - Reassign tasks
+
+Đặc biệt:
+  - Nếu task có unresolved dependencies → tự động reset về "inbox"
+    (trừ khi task đã done)
+  - Track rework: lưu previous_in_progress_at khi quay lại in_progress
+```
+
+### Sơ đồ trạng thái Task
+
+```
+                        ┌──────────────────────────────────────┐
+                        │                                      │
+                        │  ┌─────────┐    Worker assigns self  │
+                        └──│  Inbox  │◄──────── (rework) ─────┐│
+                           └────┬────┘                        ││
+                                │ Worker: claim               ││
+                                ▼                             ││
+                        ┌──────────────┐                      ││
+                        │ In Progress  │                      ││
+                        └──────┬───────┘                      ││
+                               │ Worker: submit for review    ││
+                               ▼                              ││
+                        ┌──────────────┐                      ││
+                        │    Review    │──── Lead: reject ────┘│
+                        └──────┬───────┘                       │
+                               │ Lead: approve                 │
+                               ▼                               │
+                        ┌──────────────┐                       │
+                        │     Done     │ ← Admin can reopen ──┘
+                        └──────────────┘
+
+  Board Rules (gates):
+    require_approval_for_done ──► Need approval before done
+    require_review_before_done ──► Must go through review
+    comment_required_for_review ──► Must add comment
+    only_lead_can_change_status ──► Workers can't change
 ```
 
 ### Bước 5: Task Dependencies — "Task này phải xong trước task kia"
 
-Giống như xây nhà: phải đổ móng xong mới xây tường.
+```
+Dependencies khi tạo hoặc update task:
+  → depends_on_task_ids: [task_A_id, task_B_id]
+
+Backend validate_dependency_update():
+  1. Dedup + loại bỏ self-dependency
+  2. Tất cả dependency tasks phải cùng board
+  3. DFS kiểm tra vòng tròn trên toàn bộ dependency graph
+  4. Replace old edges bằng new edges (atomic)
+
+Constraints trong DB:
+  - UniqueConstraint(task_id, depends_on_task_id) — không trùng
+  - CheckConstraint(task_id != depends_on_task_id) — không tự phụ thuộc
+
+Blocking logic:
+  - blocked_by_task_ids = dependencies có status != "done"
+  - is_blocked = len(blocked_by_task_ids) > 0
+  - Task bị block có viền đỏ trên UI
+  - Worker không thể di chuyển task bị block ra khỏi inbox
+  - Admin di chuyển task bị block → auto reset về inbox
+
+Khi dependency hoàn thành (status → done):
+  → _reconcile_dependents_for_dependency_toggle()
+  → Thông báo tất cả tasks phụ thuộc
+  → Thông báo agents được gán
+  → Cross-board notification nếu board group
+```
 
 ```
-User mở task detail → mục Dependencies → "Add Dependency"
-  → Chọn task prerequisite
-  → POST /api/v1/tasks/{task_id}/dependencies
-    Body: { depends_on_id: prerequisite_id, dependency_type: "blocks" }
+  Task A ──depends_on──► Task B ──depends_on──► Task C
+  (A cần B xong)        (B cần C xong)
 
-Backend kiểm tra VÒNG TRÒN (circular dependency):
-  → Dùng BFS duyệt từ prerequisite:
-    "Nếu đi theo chuỗi dependency từ prerequisite,
-     có quay lại task hiện tại không?"
-  → Nếu có vòng tròn → 409 "Would create circular dependency"
-  → Không có → tạo TaskDependency record
+  Nếu thêm C depends_on A → VÒNG TRÒN → DFS phát hiện → từ chối!
 
-Hiệu ứng:
-  Khi cố kéo task bị block sang cột active:
-  → Backend check: prerequisite đã "done" chưa?
-  → Chưa → 409 "Task blocked by N dependencies"
-  → Frontend hiện cảnh báo
+  Khi C done → B unblock → agent B nhận thông báo
+  Khi B done → A unblock → agent A nhận thông báo
 ```
 
-```
-  Task A ──blocks──► Task B ──blocks──► Task C
-  (phải xong A)     (mới làm B)       (mới làm C)
-
-  Nếu thêm C blocks A → VÒNG TRÒN → từ chối!
-```
-
-### Bước 6: Board Snapshots — "Chụp ảnh bảng mỗi ngày"
+### Bước 6: Board Snapshot & Group Snapshot
 
 ```
-Định kỳ hoặc khi admin trigger:
-  → create_board_snapshot()
-  → Đếm tất cả tasks theo status, priority
-  → Lưu BoardSnapshot: {
-      total_tasks: 42,
-      status_breakdown: { todo: 10, in_progress: 8, done: 24 },
-      priority_breakdown: { high: 5, medium: 30, low: 7 }
-    }
-  → Dùng cho: burndown chart, velocity tracking, báo cáo lịch sử
+Board Snapshot — "Ảnh chụp toàn bộ board":
+  GET /api/v1/boards/{board_id}/snapshot
+  → 1 API call = tất cả data cần hiển thị board
+  → Tasks enriched với blocking info, tags, approval counts
+  → Agents, Approvals, Chat messages
+  → Dùng cho page load ban đầu
+
+Board Group Snapshot — "Nhìn qua các board liên quan":
+  GET /api/v1/boards/{board_id}/group-snapshot
+  → Các board cùng group
+  → Task counts theo status cho mỗi board
+  → Limited task summaries (tối đa per_board_task_limit)
+  → Dùng cho cross-board coordination
+
+Real-time sau đó: SSE streams cập nhật từng event
+  → Server poll DB mỗi 2 giây
+  → Push event: { type: "task.created|updated|status_changed", task: {...} }
+  → Dedup 2000 event IDs
+  → FLIP animation cho task cards khi status thay đổi
 ```
 
 ---

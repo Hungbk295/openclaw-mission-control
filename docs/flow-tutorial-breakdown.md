@@ -83,7 +83,7 @@ Nếu AUTH_MODE = "local" HOẶC không set gì
 
 ```
                                               ┌─────────────────┐
- User nhập token ──► POST /auth/verify ──────►│  compare_digest  │
+ User nhập token ──► GET /users/me ──────────►│  compare_digest  │
                                               │  token == ENV?   │
                                               └────────┬────────┘
                                                   ✅ │  ❌
@@ -93,7 +93,7 @@ Nếu AUTH_MODE = "local" HOẶC không set gì
                                    lưu token
                                         │
                                         ▼
-                                   App hiện ra
+                                 window.location.reload()
 ```
 
 ### Bước 2b: Clerk Auth — "Quẹt thẻ nhân viên"
@@ -369,32 +369,34 @@ Hiệu ứng:
 
 Tưởng tượng bạn đang quản lý một đội ngũ robot trong nhà máy:
 - **Tạo agent** = tuyển robot mới, cấp thẻ nhân viên
-- **Provision** = đăng ký robot vào hệ thống nhà máy
-- **Heartbeat** = robot báo "tôi vẫn sống" mỗi vài phút
-- **Claim task** = robot nhận việc
-- **Complete** = robot hoàn thành và báo cáo
+- **Provision** = đăng ký robot vào hệ thống nhà máy + cấp tài liệu hướng dẫn
+- **Heartbeat** = robot báo "tôi vẫn sống" mỗi 10 phút
+- **Board Lead** = quản đốc robot, mỗi board có 1 lead
+- **Worker** = robot công nhân, nhận task từ lead hoặc tự nhận
 
 ### Bước 1: Đăng ký Agent — "Tuyển robot mới"
 
 ```
-Admin vào /agents → "Register Agent"
-  → Form: tên, mô tả, loại (worker/reviewer/orchestrator), capabilities
+Admin vào /agents/new → Form: tên, board, role, emoji, communication style, heartbeat interval
 
 POST /api/v1/agents
-Body: { name: "CodeBot", agent_type: "worker", capabilities: ["code_review", "testing"] }
+Body: { name: "CodeBot", board_id: "...", identity_profile: { role: "...", emoji: ":gear:" } }
 
-Backend:
-  1. Tạo token ngẫu nhiên: 32-byte URL-safe random token
-  2. Hash token: PBKDF2-HMAC-SHA256 (200K iterations, random salt) → lưu hash vào DB
-  3. Tạo Agent record (status: "idle")
-  4. Trả về: { ...agent_data, agent_token: "<plain-token>" }
+Backend (AgentLifecycleService.create_agent):
+  1. Validate: board + gateway phải tồn tại
+  2. Enforce spawn limits (max_agents per board, excluding lead)
+  3. Ensure unique name within board + gateway workspace
+  4. Tạo token: mint_agent_token() → 43-char URL-safe random token
+  5. Hash token: PBKDF2-HMAC-SHA256 (200K iterations, 16-byte random salt)
+  6. Resolve session key (lead → board-based key, worker → UUID-based key)
+  7. Tạo Agent record (status: "provisioning")
+  8. Trigger provisioning: AgentLifecycleOrchestrator.run_lifecycle()
+  9. Trả về: { ...agent_data, agent_token: "<plain-token>" }
                                           ⬆ CHỈ HIỆN 1 LẦN DUY NHẤT!
 
 Frontend:
-  → Hiện AgentTokenDisplay:
-    "⚠️ Copy token này ngay. Nó sẽ KHÔNG hiện lại."
-    [sk_agent_a8f3k2j5...] [📋 Copy]
-  → Admin copy token, cấu hình cho chương trình agent
+  → Hiện token display: "Copy token này ngay. Nó sẽ KHÔNG hiện lại."
+  → Agent list auto-refetch mỗi 15 giây để thấy status thay đổi
 ```
 
 ```
@@ -402,127 +404,214 @@ Frontend:
   │                                                       │
   │  Raw Token: "sk_agent_a8f3k2..."                      │
   │       │                                               │
-  │       ├──► PBKDF2(200K iter, random salt) ──► DB hash │
+  │       ├──► PBKDF2(200K iter, 16-byte salt) ──► DB hash│
   │       │    Format: pbkdf2_sha256$200000$salt$digest    │
+  │       │                                               │
+  │       ├──► Embed vào TOOLS.md (trên gateway)          │
   │       │                                               │
   │       └──► Hiện cho admin (1 lần duy nhất)            │
   │                                                       │
   └───────────────────────────────────────────────────────┘
 
-  Sau đó: Token gốc KHÔNG CÒN ở đâu trong hệ thống.
+  Sau đó: Token gốc KHÔNG CÒN ở đâu trong hệ thống (trừ gateway workspace).
           Mất = phải regenerate token mới.
 ```
 
-### Bước 2: Agent bắt đầu làm việc — "Robot vào ca"
+### Bước 2: Provisioning — "Chuẩn bị chỗ làm việc cho robot"
+
+Đây là bước quan trọng nhất. Giống như khi nhân viên mới vào công ty: cần chuẩn bị
+bàn làm việc, tài liệu onboarding, badge, và danh sách nhiệm vụ.
 
 ```
-Agent process khởi động:
-  1. GET /api/v1/agent/me  (header: X-Agent-Token: <token>)
-     → "Tôi là ai? Tôi thuộc board nào?"
-     → Response: { id, name, board_id, capabilities }
+OpenClawGatewayProvisioner.apply_agent_lifecycle() thực hiện 3 giai đoạn:
 
-  2. GET /api/v1/agent/board
-     → "Board tôi trông như thế nào?"
-     → Response: { column_config, other_agents }
+GIAI ĐOẠN 1: Đăng ký agent trên Gateway
+  → RPC gọi agents.create → agents.update trên gateway
+  → Tạo workspace directory trên gateway filesystem
+  → Đăng ký agent trong gateway runtime
 
-  3. GET /api/v1/agent/tasks?status=todo
-     → "Có việc gì cần làm?"
-     → Response: [task1, task2, task3]
+GIAI ĐOẠN 2: Đồng bộ template files (Jinja2 rendering)
+  Hệ thống render và upload các file hướng dẫn cho agent:
+
+  ┌─ Chung cho mọi agent ────────────────────────────────┐
+  │ IDENTITY.md  — "Bạn là ai?" (role, communication style)│
+  │ SOUL.md      — "Bạn nghĩ gì?" (system prompt sâu)   │
+  │ HEARTBEAT.md — "Bạn phải báo cáo thế nào?"          │
+  │ BOOTSTRAP.md — "Lần đầu bạn làm gì?"                │
+  │ TOOLS.md     — "Bạn có gì?" (auth token, tool defs)  │
+  │ AGENTS.md    — "Đồng nghiệp của bạn là ai?"         │
+  │ ROUTING.md   — "Ai gửi tin nhắn cho ai?"             │
+  │ LEARNINGS.md — "Bạn đã học được gì?"                 │
+  └───────────────────────────────────────────────────────┘
+
+  ┌─ Thêm cho Board Lead ────────────────────────────────┐
+  │ USER.md      — "Sếp của bạn muốn gì?"               │
+  │ ROLE.md      — "Vai trò quản đốc"                    │
+  │ WORKFLOW.md  — "Quy trình làm việc"                  │
+  └───────────────────────────────────────────────────────┘
+
+  Lưu ý: Một số file "editable" (USER.md, MEMORY.md) được BẢO VỆ
+  khi update — không bị ghi đè trừ khi overwrite=true.
+
+GIAI ĐOẠN 3: Đánh thức agent (wake=true)
+  → ensure_session() → tạo OpenClaw session
+  → send_message() → gửi tin nhắn đánh thức
+  → Tin nhắn: "Đọc BOOTSTRAP.md, rồi AGENTS.md, rồi bắt đầu heartbeat"
+  → Đặt checkin_deadline_at = now + 5 phút (deadline check-in)
 ```
 
-### Bước 3: Agent nhận và làm task — "Robot bắt tay vào việc"
+### Bước 3: Agent bắt đầu làm việc — "Robot vào ca"
+
+```
+Agent được đánh thức bởi gateway:
+  1. Đọc BOOTSTRAP.md → hiểu mình cần làm gì lần đầu
+  2. Đọc AGENTS.md → biết đồng nghiệp robot khác
+  3. Gửi heartbeat đầu tiên:
+     → POST /api/v1/agents/{agent_id}/heartbeat
+     → Backend: last_seen_at = now, status: "provisioning" → "online"
+     → Reset wake_attempts = 0, checkin_deadline_at = null
+
+  4. Bắt đầu vòng lặp làm việc:
+     → GET /api/v1/agent/tasks → xem task cần làm
+     → Làm task, gửi comments cập nhật tiến độ
+     → Heartbeat mỗi 10 phút (configurable per-agent)
+```
+
+### Bước 4: Agent nhận và làm task — "Robot bắt tay vào việc"
 
 ```
 Agent chọn task phù hợp:
   → POST /api/v1/agent/tasks/{task_id}/claim
-
-  Backend:
-    1. Task đã có agent khác claim? → 409 "Already claimed"
-    2. Gán task.assignee_agent_id = agent.id
-    3. task.status = "in_progress"
-    4. agent.status = "working"
-    5. Activity: "task.claimed"
+  → Gán task.assignee_agent_id = agent.id
+  → task.status = "in_progress"
+  → Activity: "task.claimed"
 
 Trong khi làm, agent gửi cập nhật:
   → POST /api/v1/agent/tasks/{task_id}/comments
     Body: { content: "Đang xử lý bước 3/5..." }
 
-  → POST /api/v1/agent/heartbeat  (mỗi 1-2 phút)
-    → Backend cập nhật last_heartbeat_at
-    → Nếu agent đang "offline" → chuyển về "idle"
-
 Khi hoàn thành:
   → POST /api/v1/agent/tasks/{task_id}/complete
     Body: { result: "Đã fix 3 bugs", notes: "Chi tiết..." }
+  → task.status = "done", task.completed_at = now
+  → Activity: "task.completed", Webhook dispatched
 
-  Backend:
-    1. task.status = "done", task.completed_at = now
-    2. Lưu result vào custom_fields
-    3. agent.status = "idle" (sẵn sàng nhận việc mới)
-    4. Activity: "task.completed"
-    5. Webhook dispatched
+Hoặc gửi review:
+  → POST /api/v1/agent/tasks/{task_id}/submit-for-review
+  → task.status = "review"
+  → Human reviewer xem xét
+
+Board Lead agent có thêm quyền:
+  → Tạo/xoá worker agents trên board mình
+  → Broadcast tin nhắn cho tất cả agents
+  → Nudge agent khác: POST /api/v1/agent/nudge
+  → Hỏi user: tạo approval request
 ```
 
-### Bước 4: Agent gặp sự cố — "Robot bị lỗi"
+### Bước 5: Agent gặp sự cố — "Robot bị kẹt"
 
 ```
-Agent gặp lỗi:
-  → POST /api/v1/agent/tasks/{task_id}/error
-    Body: { error_message: "API rate limit exceeded" }
+Agent không gửi heartbeat (mất tích):
+  → Sau ~10 phút không heartbeat → computed status = "offline"
+    (with_computed_status() tính lại dựa trên last_seen_at)
 
-  Backend:
-    1. Lưu lỗi vào task.custom_fields.last_error
-    2. agent.status = "error"
-    3. Nếu config auto_reassign_on_error = true:
-       → Gỡ agent khỏi task, task.status = "todo" (để người khác nhận)
+Wake Escalation — "Cố đánh thức robot":
+  1. Lần đầu hết deadline (5 phút sau wake):
+     → Lifecycle reconciliation job chạy
+     → Re-provision agent (gửi lại template files)
+     → Gửi wakeup message lần nữa
+     → wake_attempts += 1
+     → Đặt checkin_deadline_at mới
 
-Agent không gửi heartbeat:
-  → 2 phút: HealthStatus = DEGRADED (cảnh báo)
-  → 5 phút: HealthStatus = OFFLINE
-    → agent.status = "offline"
-    → Activity: "agent.went_offline"
-    → Admin nhận thông báo
+  2. Lặp lại tối đa 5 lần (MAX_WAKE_ATTEMPTS_WITHOUT_CHECKIN)
+
+  3. Sau 5 lần vẫn không check-in:
+     → status → "offline" vĩnh viễn
+     → Error logged
+     → Admin cần can thiệp
+
+Khi agent heartbeat lại thành công:
+  → wake_attempts = 0
+  → checkin_deadline_at = null
+  → last_provision_error = null
+  → status = "online"
+  → Vòng lặp làm việc tiếp tục
+
+Khi agent bị xoá:
+  → DELETE /api/v1/agents/{id}
+  → Tất cả in-progress tasks → unassigned, status → inbox
+  → Deprovision khỏi gateway
+  → Thông báo gateway-main agent cleanup
 ```
 
-### Bước 5: Vòng đời Agent — "Sơ đồ trạng thái"
+### Bước 6: Vòng đời Agent — "Sơ đồ trạng thái"
 
 ```
-                    ┌─────────┐
-                    │ Created │
-                    └────┬────┘
-                         │ (activate)
-                         ▼
-              ┌──────── idle ◄────────────┐
-              │          │                │
-              │    (claim task)      (complete/
-              │          │          submit/retry)
-              │          ▼                │
-              │       working ────────────┘
-              │          │
-              │     (error occurs)
-              │          ▼
-              │        error
-              │          │
-              │    (admin restart)
-              │          │
-              └──────────┘
+                    ┌──────────────┐
+                    │   Created    │
+                    └──────┬───────┘
+                           │ (provision triggered)
+                           ▼
+                    ┌──────────────┐
+             ┌────►│ provisioning │ ← gửi templates + wakeup message
+             │     └──────┬───────┘
+             │            │ (first heartbeat received)
+             │            ▼
+             │     ┌──────────────┐     heartbeat mỗi 10 phút
+             │     │    online    │◄────────────────────────┐
+             │     └──────┬───────┘                        │
+             │            │                                │
+             │    (no heartbeat ~10min)                     │
+             │            ▼                                │
+             │     ┌──────────────┐    (heartbeat lại)     │
+             ├────►│   offline    │────────────────────────►┘
+             │     └──────┬───────┘
+             │            │
+             │    (re-provision & wake)
+             │     tối đa 5 lần
+             │            │
+             │     ┌──────┴───────┐
+             │     │  Vẫn không   │
+             │     │  check-in?   │
+             │     └──────┬───────┘
+             │            │ → offline vĩnh viễn
+             │            │   (cần admin can thiệp)
+             │
+             │  Các trạng thái đặc biệt:
+             │     ┌──────────────┐
+             ├────►│   updating   │ ← user/lead trigger update
+             │     └──────────────┘
+             │     ┌──────────────┐
+             ├────►│   deleting   │ ← xoá agent
+             │     └──────────────┘
+             │     ┌──────────────┐
+             └────►│    paused    │ ← board memory command /pause
+                   └──────────────┘
 
-   Bất kỳ lúc nào:
-     idle/working ──(no heartbeat 5min)──► offline
-     offline ──(heartbeat received)──► idle
-     any ──(admin deactivate)──► offline (is_active=false)
-     offline ──(admin activate)──► idle
-     any ──(admin pause)──► paused
-     paused ──(admin resume)──► idle
+  Computed vs Explicit status:
+    DB lưu explicit status, nhưng with_computed_status() tính lại:
+    - last_seen_at == null && status != updating/deleting → "provisioning"
+    - last_seen_at quá cũ (>10min) → "offline"
+    - Còn lại → dùng explicit status
 ```
 
-### Agent Types — "Các loại robot"
+### Agent Types & Roles — "Các loại robot"
 
-| Type | Vai trò | Liên tưởng |
-|------|---------|------------|
-| `worker` | Làm task thực tế | Công nhân trong dây chuyền |
-| `reviewer` | Review/approve kết quả | QC kiểm tra chất lượng |
-| `orchestrator` | Điều phối agent khác | Quản đốc phân công việc |
+| Concept | Vai trò | Liên tưởng |
+|---------|---------|------------|
+| **Board Lead** | 1 per board, quản lý workers, tạo/xoá agent, broadcast | Quản đốc nhà máy |
+| **Worker** | Nhận task, làm việc, báo cáo | Công nhân dây chuyền |
+| **Gateway-Main** | Agent không thuộc board nào, quản lý cấp gateway | Giám đốc nhà máy |
+
+**Identity Profile** — mỗi agent có "tính cách":
+```
+{
+  role: "Code reviewer",           ← vai trò
+  communication_style: "concise",  ← phong cách giao tiếp
+  emoji: ":gear:"                  ← biểu tượng đại diện
+}
+```
+Render vào IDENTITY.md để agent biết mình cần hành xử thế nào.
 
 ---
 

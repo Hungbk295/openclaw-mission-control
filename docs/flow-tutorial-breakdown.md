@@ -621,74 +621,63 @@ Render vào IDENTITY.md để agent biết mình cần hành xử thế nào.
 
 Giống như quy trình **ký duyệt giấy tờ** trong công ty:
 - Nhân viên (hoặc robot) gửi đơn xin phê duyệt
-- Đơn được giao cho người có thẩm quyền
-- Người duyệt có thể: Duyệt ✅, Từ chối ❌, hoặc để quá hạn ⏰
-- Một số công việc bị **chặn** cho đến khi đơn được duyệt
+- Đơn được giao cho người có thẩm quyền (board lead)
+- Người duyệt có thể: Duyệt ✅ hoặc Từ chối ❌
+- Mỗi task chỉ có **tối đa 1 approval pending** tại một thời điểm
+- Khi quyết định xong → board lead agent được **tự động thông báo** qua gateway
 
 ### Bước 1: Tạo yêu cầu phê duyệt
 
 ```
 Ai có thể tạo: User HOẶC Agent
 
-Ví dụ: Agent "DeployBot" muốn deploy lên production:
-  → POST /api/v1/approvals {
-      title: "Deploy PR #42 to production",
-      approval_type: "deployment",
-      priority: "high",
-      assigned_to_user_id: lead_id,     ← Giao cho ai duyệt
-      task_ids: [deploy_task_id],       ← Link tới task nào
-      link_type: "blocks",             ← Task bị chặn cho đến khi duyệt
-      context: {                       ← Thông tin bổ sung
+Ví dụ: Agent "CodeBot" muốn deploy lên production:
+  → POST /api/v1/boards/{board_id}/approvals {
+      action_type: "deploy_to_production",
+      task_ids: [deploy_task_id],         ← Link tới task nào (1 hoặc nhiều)
+      agent_id: agent_id,                 ← Agent nào yêu cầu
+      confidence: 0.95,                   ← Độ tự tin của agent
+      rubric_scores: {...},               ← Điểm đánh giá (tuỳ chọn)
+      payload: {                          ← Thông tin bổ sung
         pr_url: "github.com/...",
         test_results: "all passing"
       }
     }
 
-Backend:
-  1. Tạo Approval (status: "pending")
-  2. Tạo ApprovalTaskLink → liên kết approval với deploy_task
-  3. Activity: "approval.created"
-  4. Webhook: "approval.created"
+Backend (create approval):
+  1. Normalize task IDs (dedupes, merges task_id + task_ids + payload.taskId)
+  2. Lock tasks theo thứ tự deterministic (tránh deadlock)
+  3. Kiểm tra: task này đã có pending approval chưa?
+     → Nếu có → 409 Conflict
+  4. Tạo Approval record (status: "pending")
+  5. Tạo ApprovalTaskLink rows (many-to-many)
+  6. Ghi activity event
 ```
 
 ### Bước 2: Người duyệt xem và quyết định
 
 ```
-Board lead vào /approvals
-  → Tab "Pending" hiện danh sách đơn chờ duyệt
-  → ApprovalCard hiển thị:
-    ┌──────────────────────────────────────────┐
-    │ 🔴 HIGH  Deploy PR #42 to production     │
-    │ Requested by: DeployBot (agent)          │
-    │ Linked tasks: 1 task blocked             │
-    │ Context: PR #42, tests all passing       │
-    │                                          │
-    │         [✅ Approve]  [❌ Reject]         │
-    └──────────────────────────────────────────┘
+User vào /approvals (cross-board view, polls mỗi 15 giây)
+  → Hiện danh sách đơn chờ duyệt với task titles
+
+  Hoặc dùng SSE real-time:
+  → GET /api/v1/boards/{board_id}/approvals/stream
+  → Server push mỗi 2 giây nếu có thay đổi
+  → Gửi: approval data + pending_approvals_count + task-level counts
 
 Duyệt:
-  → POST /api/v1/approvals/{id}/approve { note: "LGTM, ship it" }
-  → approval.status = "approved"
-  → Linked task được UNBLOCK:
-    - task.status "blocked" → "todo" (sẵn sàng thực hiện)
-  → Activity: "approval.approved"
-  → Agent thấy approval đã duyệt → tiến hành deploy
+  → PATCH /api/v1/boards/{board_id}/approvals/{id} { status: "approved" }
+  → approval.status = "approved", resolved_at = now
+  → Board lead agent được THÔNG BÁO tự động:
+    → GatewayDispatchService gửi message tới lead's openclaw_session_id
+    → Nội dung: board name, approval ID, action type, decision, task IDs
+    → Activity: "approval.lead_notified"
+  → Agent thấy approval đã duyệt → tiến hành công việc
 
 Từ chối:
-  → POST /api/v1/approvals/{id}/reject { note: "Cần thêm test" }
-  → approval.status = "rejected"
-  → Task vẫn bị block
-  → Agent thấy từ chối → xử lý feedback
-```
-
-### Bước 3: Tự động hết hạn
-
-```
-Nếu approval có expires_at và quá thời gian:
-  → Job định kỳ chạy check_expired_approvals()
-  → Tìm approval pending + expires_at < now
-  → Chuyển status = "expired"
-  → Task vẫn bị block (cần tạo approval mới)
+  → PATCH /api/v1/boards/{board_id}/approvals/{id} { status: "rejected" }
+  → Board lead agent cũng được thông báo rejection
+  → Agent xem feedback, điều chỉnh
 ```
 
 ### Sơ đồ trạng thái Approval
@@ -698,21 +687,34 @@ Nếu approval có expires_at và quá thời gian:
               │ pending  │
               └────┬─────┘
                    │
-         ┌────────┼────────┐
-         ▼        ▼        ▼
-    ┌────────┐ ┌────────┐ ┌─────────┐
-    │approved│ │rejected│ │cancelled│
-    └────────┘ └────────┘ └─────────┘
-                          (requester huỷ)
+         ┌────────┴────────┐
+         ▼                 ▼
+    ┌────────┐        ┌────────┐
+    │approved│        │rejected│
+    └────┬───┘        └────────┘
          │
-    quá hạn?
          ▼
-    ┌────────┐
-    │expired │
-    └────────┘
+  Board lead agent
+  tự động nhận thông báo
+  qua GatewayDispatchService
 
-Khi approved + link_type="blocks":
-  → Linked tasks tự động unblock
+Ràng buộc:
+  - Mỗi task chỉ có 1 pending approval tại 1 thời điểm
+  - Task IDs locked theo thứ tự deterministic (chống deadlock)
+  - Optimistic UI updates trên frontend
+```
+
+### Approval & Board require_approval_for_done
+
+```
+Board có setting: require_approval_for_done (mặc định = true)
+  → Khi agent muốn đánh dấu task "done"
+  → Phải tạo approval trước
+  → User duyệt → task mới thực sự done
+
+Ngoại lệ: Nếu board onboarding detect autonomy_level = "fully autonomous"
+  → require_approval_for_done = false
+  → Agent tự do đánh dấu done không cần duyệt
 ```
 
 ---
@@ -721,238 +723,345 @@ Khi approved + link_type="blocks":
 
 ### Liên tưởng
 
-Gateway giống như **bến xe** nơi các agent (xe buýt) đỗ và được quản lý:
-- Gateway là hệ thống bên ngoài chạy các agent
-- Mission Control không trực tiếp chạy agent, mà **đăng ký và giám sát** qua gateway
-- Một gateway có thể quản lý nhiều agent
+Gateway giống như **nhà máy** nơi các agent (robot) thực sự chạy:
+- Mission Control là **trung tâm điều khiển** (ra lệnh, giám sát)
+- Gateway là **sàn sản xuất** (nơi robot hoạt động thực tế)
+- Gateway kết nối qua **WebSocket** (ws:// hoặc wss://)
+- Mỗi gateway tự động có 1 **Main Agent** (giám đốc nhà máy)
 
 ### Bước 1: Thêm Gateway
 
 ```
-Admin vào /gateways → "Add Gateway"
-  → Form: tên, endpoint URL, API key, loại (openclaw/custom)
+Org admin vào /gateways/new
+  → Form: tên, WebSocket URL, token, workspace_root
 
 POST /api/v1/gateways {
   name: "Production Gateway",
-  endpoint_url: "https://gateway.example.com/api",
-  api_key: "gw_sk_...",
-  gateway_type: "openclaw"
+  url: "wss://gateway.example.com:8080",    ← WebSocket URL (phải có port)
+  token: "gw_token_...",
+  workspace_root: "/opt/agents"             ← Thư mục gốc trên gateway
 }
 
-→ Tạo Gateway record (status: "unknown")
+Backend (GatewayAdminLifecycleService):
+  1. Validate gateway runtime compatible (kết nối thử)
+  2. Tạo Gateway record
+  3. TỰ ĐỘNG tạo Main Agent:
+     → ensure_main_agent(action="provision")
+     → Main Agent = agent không thuộc board nào
+     → Quản lý gateway-level operations
 ```
 
-### Bước 2: Health Check — "Gateway có sống không?"
+**Validation WebSocket URL:**
+```
+Frontend (validateGatewayUrl):
+  ✅ wss://gateway.example.com:8080  (có port, HTTPS)
+  ✅ ws://localhost:9090              (có port, dev mode)
+  ❌ https://gateway.example.com      (không phải ws/wss)
+  ❌ wss://gateway.example.com        (thiếu port)
+```
+
+### Bước 2: Kiểm tra kết nối
 
 ```
-POST /api/v1/gateways/{id}/health-check
+Frontend gọi checkGatewayConnection():
+  → POST /api/v1/gateways/status
+  → Backend thử kết nối WebSocket tới gateway
+  → Trả về trạng thái kết nối
+```
+
+### Bước 3: Template Sync — "Cập nhật tài liệu cho tất cả robot"
+
+```
+POST /api/v1/gateways/{gateway_id}/templates/sync
+  Query params:
+    include_main: true/false       ← Sync cả main agent?
+    reset_sessions: true/false     ← Reset agent sessions?
+    rotate_tokens: true/false      ← Tạo token mới cho tất cả agent?
+    force_bootstrap: true/false    ← Buộc chạy lại bootstrap?
+    overwrite: true/false          ← Ghi đè file editable?
+    lead_only: true/false          ← Chỉ sync board leads?
+    board_id: uuid                 ← Chỉ sync 1 board?
+
+Trả về: { agents_updated, agents_skipped, main_updated, errors[] }
+```
+
+Đây là tính năng mạnh: cập nhật hàng loạt template files cho tất cả agent trên gateway.
+
+### Bước 4: Xoá Gateway
+
+```
+DELETE /api/v1/gateways/{gateway_id}
 
 Backend:
-  1. Gọi GET {endpoint_url}/health (timeout 10s)
-  2. Response 200 → status = "connected" ✅
-  3. Timeout → status = "disconnected" 🔌
-  4. Lỗi khác → status = "error" ❌
-  5. Cập nhật last_health_check_at
-
-Frontend hiện badge:
-  🟢 Connected (xanh lá)
-  🔴 Error (đỏ)
-  ⚪ Unknown (xám)
-```
-
-### Bước 3: Provision Agent qua Gateway
-
-```
-Khi tạo agent với gateway_id:
-  → provision_agent() gọi POST {gateway_url}/agents/provision
-    Body: { agent_name, agent_type, capabilities, config }
-  → Gateway trả về gateway_agent_id (ID trong hệ thống gateway)
-  → Lưu vào agent.gateway_agent_id
-  → agent.provisioned_at = now
-
-Khi xoá agent:
-  → deprovision_agent() gọi DELETE {gateway_url}/agents/{gateway_agent_id}
-  → Xoá agent khỏi gateway
+  1. Xoá Main Agent + duplicate agents
+  2. Cascade xoá GatewayInstalledSkill rows
+  3. Clear agent foreign keys trước khi xoá
+  4. Xoá Gateway record
 ```
 
 ```
-  Mission Control                    Gateway
-  ┌──────────────┐                ┌──────────────┐
-  │              │  POST /provision│              │
-  │  Agent record├───────────────►│ Tạo runtime  │
-  │  (DB)        │◄───────────────┤ cho agent    │
-  │              │  gateway_agent_id              │
-  │              │                │              │
-  │              │  GET /health   │              │
-  │              ├───────────────►│  {"ok":true} │
-  │              │◄───────────────┤              │
-  └──────────────┘                └──────────────┘
+  Mission Control                         Gateway (WebSocket)
+  ┌──────────────┐                     ┌──────────────────┐
+  │              │  ws://connect        │                  │
+  │  Gateway     ├────────────────────►│  Agent Runtime   │
+  │  record (DB) │                      │                  │
+  │              │  RPC: agents.create  │  ┌─ Main Agent  │
+  │  Main Agent  ├────────────────────►│  │  (gateway-wide)│
+  │              │  RPC: agents.update  │  │               │
+  │              ├────────────────────►│  ├─ Board Lead   │
+  │  Board Agents│                      │  │  (per board)  │
+  │              │  Templates sync      │  │               │
+  │              ├────────────────────►│  └─ Workers      │
+  │              │                      │     (per board)  │
+  └──────────────┘                     └──────────────────┘
 ```
 
 ---
 
-## Flow 6: Webhook — "Chuông báo tự động"
+## Flow 6: Webhook — "Hộp thư đến của Board"
 
 ### Liên tưởng
 
-Webhook giống như **dịch vụ gửi thông báo tự động**:
-- Bạn đăng ký: "Khi có task mới trên board X, gửi tin nhắn vào Slack"
-- Hệ thống tự động gửi mỗi khi sự kiện xảy ra
-- Nếu gửi thất bại nhiều lần → tự động tắt (tránh spam)
+Webhook trong Mission Control hoạt động ngược lại so với webhook thông thường:
+- Đây là **INBOUND webhook** — hệ thống bên ngoài gửi dữ liệu VÀO Mission Control
+- Giống như **hộp thư** của board: bên ngoài gửi thư vào, board lead agent đọc và xử lý
+- Mỗi webhook tạo ra một **endpoint URL** riêng biệt để bên ngoài POST dữ liệu vào
+- Payload được lưu vào **Board Memory** để agent có thể truy cập
 
-### Bước 1: Cấu hình Webhook
+### Bước 1: Tạo Webhook Endpoint
 
 ```
-Board admin → Board Settings → Webhooks → "Add Webhook"
-  → URL: "https://hooks.slack.com/..."
-  → Secret: "whsec_abc123" (tuỳ chọn, dùng để xác minh)
-  → Events: ☑ task.created  ☑ task.completed  ☑ approval.created
-  → Bấm "Save"
+Board admin → Webhooks → "Add Webhook"
+  → Form: description, enabled, agent_id (tuỳ chọn — ai sẽ nhận thông báo)
 
-POST /api/v1/board-webhooks {
-  board_id, url, secret, events: ["task.created", "task.completed", ...]
+POST /api/v1/boards/{board_id}/webhooks {
+  description: "GitHub PR notifications",
+  enabled: true,
+  agent_id: null                ← null = giao cho board lead mặc định
 }
-```
 
-### Bước 2: Test Webhook — "Thử chuông kêu không"
-
-```
-POST /api/v1/board-webhooks/{id}/test
-
-Backend gửi payload test:
+Backend trả về:
 {
-  "event": "webhook.test",
-  "timestamp": "2024-01-01T00:00:00Z",
-  "data": { "message": "This is a test webhook delivery" }
+  id: "abc-123",
+  endpoint_path: "/api/v1/boards/{board_id}/webhooks/abc-123",
+  endpoint_url: "https://your-server.com/api/v1/boards/{board_id}/webhooks/abc-123",
+  ...
 }
-
-→ Trả về: ✅ status_code: 200  hoặc  ❌ error
+  ⬆ Đây là URL bạn cấu hình ở GitHub/Slack/etc.
 ```
 
-### Bước 3: Webhook tự động kích hoạt
+### Bước 2: Bên ngoài gửi dữ liệu vào
 
 ```
-Khi user tạo task trên board:
-  1. create_task() gọi dispatch_webhook()
-  2. Tìm tất cả webhook của board đang active + subscribe "task.created"
-  3. Với mỗi webhook khớp:
-     → Đưa vào hàng đợi RQ (Redis Queue) — KHÔNG gửi trực tiếp
-     → Tránh block API response
+GitHub (hoặc bất kỳ service nào) POST tới endpoint URL:
+  POST /api/v1/boards/{board_id}/webhooks/{webhook_id}
+  Body: { "action": "opened", "pull_request": {...} }
 
-RQ Worker xử lý (process riêng):
-  1. Lấy webhook config từ DB
-  2. Build payload:
-     {
-       "event": "task.created",
-       "timestamp": "...",
-       "board_id": "...",
-       "data": { ...task_data }
-     }
-  3. Nếu có secret → tạo HMAC-SHA256 signature
-  4. POST tới webhook URL kèm headers:
-     - X-Webhook-Event: "task.created"
-     - X-Webhook-Signature-256: "sha256=..." (nếu có secret)
-     - X-Webhook-Delivery-Id: "<uuid>" (ID giao hàng)
-  5. Ghi nhận kết quả
+Backend xử lý (trả về 202 ACCEPTED ngay lập tức):
+  1. Validate: webhook tồn tại VÀ enabled
+  2. Decode body (JSON auto-detect, fallback raw text)
+  3. Capture headers (content-type, user-agent, x-* headers)
+  4. Lưu BoardWebhookPayload:
+     → payload, headers, source_ip, content_type, received_at
+  5. Tạo BoardMemory entry (để agent đọc được):
+     → Tags: "webhook", "webhook:{webhook_id}", "payload:{payload_id}"
+  6. Đưa vào Redis queue (enqueue_webhook_delivery)
+     → Nếu queue fail → fallback gửi thông báo đồng bộ
+```
 
-Retry khi thất bại:
-  → Lần 1: đợi 10 giây
-  → Lần 2: đợi 1 phút
-  → Lần 3: đợi 5 phút
-  → Sau 10 lần thất bại liên tiếp → TỰ ĐỘNG TẮT webhook
+### Bước 3: Agent nhận thông báo
+
+```
+RQ Worker (flush_webhook_delivery_queue) xử lý:
+  1. Dequeue từ Redis
+  2. Load webhook/payload/board context từ DB
+  3. Xác định agent mục tiêu:
+     → webhook.agent_id nếu có
+     → HOẶC board lead (is_board_lead=True)
+  4. Gửi message qua GatewayDispatchService:
+     → try_send_agent_message() tới agent's openclaw_session_id
+     → Nội dung: webhook instruction + payload preview + API ref
+
+Agent nhận message:
+  → Đọc payload preview
+  → Nếu cần chi tiết: GET /api/v1/boards/{board_id}/webhooks/{id}/payloads/{payload_id}
+  → Xử lý theo logic của agent (tạo task, update task, etc.)
+```
+
+### Retry khi thất bại
+
+```
+Retry logic (exponential backoff + jitter):
+  Base delay: rq_dispatch_retry_base_seconds * (2 ^ attempts)
+  Cap: rq_dispatch_retry_max_seconds
+  Jitter: ±10% của base delay
+  Max retries: rq_dispatch_max_retries (configurable)
+
+Throttle: rq_dispatch_throttle_seconds giữa mỗi item
 ```
 
 ```
-  Board Event ──► dispatch_webhook() ──► Redis Queue ──► RQ Worker
-                                                            │
-                                                 ┌──────────┼──────────┐
-                                                 ▼          ▼          ▼
-                                            Slack Hook  Discord Hook  Custom API
-
-  Retry: 10s → 1min → 5min
-  Auto-disable sau 10 failures liên tiếp
+  GitHub/Slack/etc.
+       │
+       │ POST payload
+       ▼
+  ┌────────────────────┐
+  │ Webhook Endpoint   │  ← 202 ACCEPTED (instant)
+  └────────┬───────────┘
+           │
+     ┌─────┼─────┐
+     ▼           ▼
+  ┌──────┐  ┌──────────┐
+  │ DB   │  │  Redis    │
+  │Payload│  │  Queue    │
+  │+Memory│  └────┬─────┘
+  └──────┘       │
+                 ▼
+           ┌──────────┐
+           │RQ Worker │
+           └────┬─────┘
+                │
+                ▼
+  GatewayDispatchService
+  → Board lead / target agent
+  → "Bạn có thư mới từ GitHub!"
 ```
 
-### HMAC Signing — "Tem chống giả"
+### Xem lại Payloads
 
 ```
-Tại sao cần secret?
-  → Đảm bảo webhook thực sự đến từ Mission Control
-  → Tránh kẻ xấu gửi webhook giả
+Admin hoặc agent có thể xem lại tất cả payload đã nhận:
+  GET /api/v1/boards/{board_id}/webhooks/{id}/payloads
+  → Paginated, ordered by received_at DESC
+  → Mỗi payload: body, headers, source_ip, received_at
 
-Cách hoạt động:
-  1. Body = JSON payload
-  2. Signature = HMAC-SHA256(secret, body)
-  3. Gửi kèm header: X-Webhook-Signature-256: sha256=<signature>
-
-Bên nhận (Slack/custom):
-  1. Nhận body + signature
-  2. Tự tính: expected = HMAC-SHA256(shared_secret, body)
-  3. So sánh: signature === expected?
-  → Khớp = webhook thật ✅
-  → Không khớp = webhook giả ❌
+Agent truy cập qua Board Memory:
+  GET /api/v1/agent/boards/{board_id}/memory?is_chat=false
+  → Filter by tags: "webhook", "webhook:{id}", "payload:{id}"
 ```
 
 ---
 
-## Flow 7: Onboarding — "Hướng dẫn người mới"
+## Flow 7: Onboarding — "Phỏng vấn để hiểu bạn"
 
 ### Liên tưởng
 
-Giống như khi bạn **mở hộp điện thoại mới** — có tờ "Quick Start Guide" hướng dẫn từng bước: bật máy, đăng nhập, cài app đầu tiên...
+Onboarding KHÔNG phải checklist tĩnh. Đây là một **cuộc trò chuyện** giữa user và
+gateway agent — giống như buổi **phỏng vấn onboarding** khi bạn vào công ty mới:
+- Agent hỏi bạn 6-10 câu hỏi về mục tiêu, phong cách làm việc
+- Bạn trả lời, agent ghi nhận
+- Cuối cùng agent đề xuất cấu hình board + tạo board lead agent
 
-### Flow chi tiết
+### Bước 1: Bắt đầu Onboarding
 
 ```
-User vừa tạo board mới → vào board detail
-  → Frontend gọi GET /api/v1/board-onboarding/{board_id}/status
+User tạo board mới → vào /onboarding
+  → POST /api/v1/boards/{board_id}/onboarding/start
 
-Backend tính toán:
-  ✅ Bước 1: Tạo board                → Luôn completed (bạn đã ở đây)
-  ⬜ Bước 2: Cấu hình columns         → column_config != null && length > 0?
-  ⬜ Bước 3: Tạo task đầu tiên        → Board có ít nhất 1 task?
-  ⬜ Bước 4: Mời team member           → Board có >= 2 members?
-  ⬜ Bước 5: Gán agent                 → Board có agent nào không?
-  ⬜ Bước 6: Cấu hình webhook (tuỳ chọn) → Board có webhook?
-
-Trả về:
-{
-  steps: [...],
-  completed_count: 1,
-  total_required: 5,
-  is_complete: false
-}
+Backend:
+  1. Tạo BoardOnboardingSession (status: "active", messages: [])
+  2. Gửi comprehensive prompt tới gateway agent qua GatewayDispatchService
+  3. Prompt hướng dẫn agent:
+     → Hỏi 6-10 câu hỏi tập trung:
+       - 3-6 câu về MỤC TIÊU (board dùng để làm gì?)
+       - 1 câu về TÊN AGENT (bạn muốn gọi agent lead là gì?)
+       - 2-4 câu về SỞ THÍCH (autonomy level, verbosity, update cadence)
+     → Thu thập user profile:
+       - preferred_name, pronouns, timezone, notes, context
+     → Thu thập lead agent config:
+       - name, identity_profile, autonomy_level, verbosity
+       - output_format, update_cadence, custom_instructions
 ```
 
-**Giao diện:**
+### Bước 2: Cuộc trò chuyện qua lại
+
 ```
-┌─────────────────────────────────────────┐
-│  🚀 Get Started with "Sprint 42"       │
-│                                         │
-│  ████░░░░░░░░░░░░░░░░  1/5 completed   │
-│                                         │
-│  ✅ Create your board                   │
-│  ⬜ Configure columns         [→ Set up]│
-│  ⬜ Create your first task    [→ Create]│
-│  ⬜ Invite a team member      [→ Invite]│
-│  ⬜ Assign an agent           [→ Assign]│
-│  ⬜ Set up webhooks (optional)[→ Setup] │
-│                                         │
-│                    [Skip for now]        │
-└─────────────────────────────────────────┘
+Gateway agent gửi câu hỏi:
+  → POST /api/v1/boards/{board_id}/onboarding/agent
+    Body: { type: "question", content: "Board này dùng để làm gì?" }
+  → Append assistant message vào messages[]
+  → Frontend hiện câu hỏi cho user
+
+User trả lời:
+  → POST /api/v1/boards/{board_id}/onboarding/answer
+    Body: { answer: "Quản lý sprint cho team backend" }
+  → Append user message vào messages[]
+  → Forward answer tới agent qua BoardOnboardingMessagingService
+  → Agent hỏi câu tiếp theo...
+
+Lặp lại 6-10 lần cho đến khi agent đủ thông tin.
 ```
 
-**Mỗi bước hoàn thành:**
-- Frontend refetch onboarding status
-- Backend kiểm tra dữ liệu thực (có task thật không? có member thật không?)
-- Progress bar cập nhật
+### Bước 3: Agent hoàn thành phỏng vấn
 
-**Dismiss:**
 ```
-User bấm "Skip for now"
-  → POST /api/v1/board-onboarding/{board_id}/dismiss
-  → board.config.onboarding_dismissed = true
-  → Banner biến mất
+Agent gửi kết quả:
+  → POST /api/v1/boards/{board_id}/onboarding/agent
+    Body: {
+      type: "complete",
+      draft_goal: {
+        board_type: "kanban",
+        objective: "Quản lý sprint team backend",
+        success_metrics: [...],
+        target_date: "2024-06-01",
+        user_profile: { preferred_name: "Hùng", timezone: "Asia/Ho_Chi_Minh" },
+        lead_agent: {
+          name: "BackendBot",
+          identity_profile: { role: "Sprint manager", emoji: ":robot:" },
+          autonomy_level: "semi-autonomous",
+          verbosity: "concise",
+          update_cadence: "daily"
+        }
+      }
+    }
+  → onboarding.status = "completed"
+  → draft_goal lưu vào DB
+  → Frontend hiện preview cho user xác nhận
+```
+
+### Bước 4: User xác nhận và Provision
+
+```
+User review draft → bấm "Confirm"
+  → POST /api/v1/boards/{board_id}/onboarding/confirm
+
+Backend:
+  1. Extract confirmed values từ draft_goal:
+     → board.board_type, objective, success_metrics, target_date
+     → board.goal_confirmed = true
+     → board.goal_source = "lead_agent_onboarding"
+
+  2. Detect autonomy level:
+     → Kiểm tra keywords: "autonomous", "fully-autonomous", "full-autonomy"
+     → Nếu fully autonomous: board.require_approval_for_done = false
+     → Mặc định: board.require_approval_for_done = true
+
+  3. Apply user_profile:
+     → Update user: preferred_name, pronouns, timezone, notes, context
+
+  4. PROVISION BOARD LEAD AGENT:
+     → OpenClawProvisioningService tạo lead agent theo draft_goal config
+     → Agent được provision trên gateway (3-stage process như Flow 3)
+
+  5. onboarding.status = "confirmed"
+```
+
+```
+  ┌─ Onboarding Flow ───────────────────────────────────────────┐
+  │                                                             │
+  │  User ◄──────────── Câu hỏi ──────────── Gateway Agent    │
+  │    │                                          ▲             │
+  │    └── Trả lời ──────────────────────────────┘             │
+  │         (6-10 rounds)                                       │
+  │                                                             │
+  │  Agent gửi draft_goal ──► User xác nhận ──► Provision Lead │
+  │                                                             │
+  │  Kết quả:                                                   │
+  │    ✅ Board configured (type, objective, metrics)           │
+  │    ✅ User profile updated (name, timezone, pronouns)       │
+  │    ✅ Board Lead Agent provisioned & ready to work          │
+  │    ✅ Autonomy level → require_approval_for_done setting    │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -961,114 +1070,114 @@ User bấm "Skip for now"
 
 ### Liên tưởng
 
-Activity Feed giống như **camera giám sát** ghi lại mọi hành động trong toà nhà:
-- Ai vào phòng nào, lúc nào
-- Ai di chuyển đồ vật (task) từ đâu tới đâu
-- Robot nào nhận việc, hoàn thành, hay gặp lỗi
-- Ai phê duyệt cái gì
+Activity Feed giống như **camera giám sát** ghi lại mọi hành động trong toà nhà.
+Đặc biệt, hệ thống có **Task Comments Stream** — feed real-time của tất cả
+comments agent đang viết trên tasks, giống như xem **live chat** của cả đội robot.
 
 ### Cách ghi nhận sự kiện
 
 ```
 Mọi hành động quan trọng đều gọi record_activity():
 
-async def record_activity(
-    session, event_type, actor,
-    board_id?, task_id?, agent_id?, approval_id?,
-    metadata?, summary?
+record_activity(
+    session,
+    event_type="task.comment",
+    message="Đang xử lý bước 3/5...",
+    agent_id=agent.id,
+    task_id=task.id,
 )
 
-Ví dụ:
-  await record_activity(session, "task.status_changed",
-    actor=auth,
-    task_id=task.id,
-    board_id=board.id,
-    metadata={"old_status": "todo", "new_status": "in_progress"}
-  )
-
-Tự động:
-  - category = event_type.split(".")[0]  → "task"
-  - actor_type = auth.actor_type         → "user" hoặc "agent"
-  - summary = tự generate nếu không truyền
+Model ActivityEvent:
+  - id, event_type, message
+  - agent_id, task_id          ← reference IDs
+  - created_at
+  - Indexed on: event_type, agent_id, task_id (fast queries)
 ```
 
 ### Danh sách event types
 
 ```
-Board:
-  board.created      │ Board được tạo
-  board.updated      │ Board settings thay đổi
-  board.archived     │ Board bị archive
-
 Task:
-  task.created        │ Task mới được tạo
-  task.updated        │ Task fields thay đổi
-  task.status_changed │ Task chuyển cột (kèm old/new status)
-  task.claimed        │ Agent nhận task
-  task.completed      │ Task hoàn thành
+  task.comment              │ Agent/user comment trên task
+  task.status_changed       │ Task chuyển cột
 
 Agent:
-  agent.created       │ Agent được đăng ký
-  agent.activated     │ Agent được bật lại
-  agent.deactivated   │ Agent bị tắt
-  agent.went_offline  │ Agent mất heartbeat
+  agent.create.*            │ Agent được tạo (direct, by lead, etc.)
+  agent.provision.direct    │ Agent được provision
+  agent.update.direct       │ Agent updated & re-provisioned
+  agent.heartbeat           │ Heartbeat nhận được
+  agent.wakeup.sent         │ Wake message gửi đi
+  agent.*.failed            │ Errors logged
+  agent.delete.direct       │ Agent bị xoá
 
 Approval:
-  approval.created    │ Yêu cầu phê duyệt mới
-  approval.approved   │ Được duyệt
-  approval.rejected   │ Bị từ chối
-
-Member:
-  member.joined       │ User mới tham gia board
+  approval.lead_notified    │ Lead agent nhận thông báo duyệt
+  approval.lead_notify_failed│ Thông báo lead thất bại
 ```
 
-### Xem Activity
+### Xem Activity — 3 cách
 
+**Cách 1: REST API (polling)**
 ```
-Toàn tổ chức:
-  GET /api/v1/activity?limit=50
+GET /api/v1/activity
   → Tất cả events gần nhất
-
-Theo board:
-  GET /api/v1/activity?board_id=xxx
-  → Chỉ events trên board đó
-
-Theo task:
-  GET /api/v1/activity?task_id=xxx
-  → Lịch sử của 1 task cụ thể
-
-Theo agent:
-  GET /api/v1/activity?agent_id=xxx
-  → Mọi hành động của agent
-
-Timeline view:
-  GET /api/v1/activity/timeline?days=7
-  → Events nhóm theo ngày (7 ngày gần nhất)
+  → Agent chỉ thấy events của mình
+  → User thấy events trên boards mình có access
+  → Paginated, ordered by created_at DESC
 ```
 
-**Giao diện Timeline:**
+**Cách 2: Task Comments Feed (enriched)**
+```
+GET /api/v1/activity/task-comments
+  → Chỉ event_type == "task.comment" có message
+  → Join với: Task (title) + Board (name) + Agent (name, role)
+  → Agent role lấy từ identity_profile.role
+  → Optional filter: board_id
+  → Response: ActivityTaskCommentFeedItemRead {
+      event_id, message, created_at,
+      board: { id, name },
+      task: { id, title },
+      agent: { id, name, role }
+    }
+```
+
+**Cách 3: SSE Real-time Stream**
+```
+GET /api/v1/activity/task-comments/stream
+  → Server-Sent Events (SSE) — browser mở connection dài
+  → Server poll DB mỗi 2 giây cho events mới
+  → Dedup: nhớ 2000 event IDs đã gửi (SSE_SEEN_MAX)
+  → Filter theo board access của caller
+  → Emit: { event: "comment", data: JSON.stringify({comment: {...}}) }
+  → Optional: board_id filter
+
+  Giống như:
+    EventSource("/api/v1/activity/task-comments/stream")
+    → onmessage: { comment: { agent: "CodeBot", message: "Đang fix bug...", task: "Login fix" } }
+```
+
+**Giao diện Activity:**
 ```
 ┌─────────────────────────────────────────────────────┐
-│  📋 Activity Feed                [Filter ▾] [7 days]│
+│  Activity Feed                     [Filter ▾]       │
 │                                                     │
 │  ── Today ──────────────────────────────────────── │
 │                                                     │
-│  🟢 Task "Fix login bug" created by John      2m   │
-│     on Board Alpha                                  │
+│  :gear: CodeBot on "Fix login bug"             2m  │
+│     "Đang xử lý bước 3/5..."                       │
 │                                                     │
-│  🔄 Agent "CodeBot" claimed "Update API docs" 15m  │
+│  :robot: DeployBot on "Deploy v2.1"           15m  │
+│     "Build passed, deploying to staging..."         │
 │                                                     │
-│  ✅ Task "Deploy v2.1" completed by DeployBot  1h  │
+│  :white_check_mark: DeployBot completed "Deploy v2.1"          1h  │
 │                                                     │
 │  ── Yesterday ─────────────────────────────────── │
 │                                                     │
-│  ⚠️ Approval "Prod deploy" pending review      2h  │
+│  :bell: Lead notified: approval "Prod deploy"  2h  │
 │                                                     │
-│  👤 Sarah joined Board Beta                    3h  │
+│  :heartbeat: CodeBot heartbeat received        5h  │
 │                                                     │
-│  🤖 Agent "CodeBot" went offline               5h  │
-│                                                     │
-│                    [Load more...]                    │
+│                    [Live updates via SSE]            │
 └─────────────────────────────────────────────────────┘
 ```
 
